@@ -147,7 +147,10 @@ __forceinline__ __device__ bool in_frustum(int idx,
 
 	// Bring points to screen space;
 	p_view = transformPoint4x3(p_orig, viewmatrix);
-
+	float4 p_hom = transformPoint4x4(p_view, projmatrix);
+	float p_w = 1.0f / (p_hom.w + 0.0000001f);
+	float3 p_proj = { p_hom.x * p_w, p_hom.y * p_w, p_hom.z * p_w };
+	
 	if (p_view.z <= 0.2f)
 	{
 		if (prefiltered)

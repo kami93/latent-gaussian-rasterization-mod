@@ -72,7 +72,15 @@ __device__ glm::vec3 computeColorFromSH(int idx, int deg, int max_coeffs, const 
 }
 
 // Forward version of 2D covariance matrix computation
-__device__ float3 computeCov2D(const float3& mean, float focal_x, float focal_y, float tan_fovx, float tan_fovy, const float* cov3D, const float* viewmatrix)
+__device__ float3 computeCov2D(
+	const float3& mean,
+	float focal_x,
+	float focal_y,
+	// float tan_fovx,
+	// float tan_fovy,
+	const float* cov3D,
+	const float* viewmatrix,
+	const float* projmatrix)
 {
 	// The following models the steps outlined by equations 29
 	// and 31 in "EWA Splatting" (Zwicker et al., 2002). 
@@ -80,12 +88,22 @@ __device__ float3 computeCov2D(const float3& mean, float focal_x, float focal_y,
 	// Transposes used to account for row-/column-major conventions.
 	float3 t = transformPoint4x3(mean, viewmatrix);
 
-	const float limx = 1.3f * tan_fovx;
-	const float limy = 1.3f * tan_fovy;
+	// const float limx = 1.3f * tan_fovx;
+	// const float limy = 1.3f * tan_fovy;
+	// const float txtz = t.x / t.z;
+	// const float tytz = t.y / t.z;
+	// t.x = min(limx, max(-limx, txtz)) * t.z;
+	// t.y = min(limy, max(-limy, tytz)) * t.z;
+
+	float fx = projmatrix[0], fy = projmatrix[5], cx = projmatrix[8], cy = projmatrix[9];
+	const float xmin = (-1.3f - cx) / fx;
+	const float xmax = (1.3f - cx) / fx;
+	const float ymin = (-1.3f - cy) / fy;
+	const float ymax = (1.3f - cy) / fy;
 	const float txtz = t.x / t.z;
 	const float tytz = t.y / t.z;
-	t.x = min(limx, max(-limx, txtz)) * t.z;
-	t.y = min(limy, max(-limy, tytz)) * t.z;
+	t.x = min(xmax, max(xmin, txtz)) * t.z;
+	t.y = min(ymax, max(ymin, tytz)) * t.z;
 
 	glm::mat3 J = glm::mat3(
 		focal_x / t.z, 0.0f, -(focal_x * t.x) / (t.z * t.z),
@@ -168,8 +186,8 @@ __global__ void preprocessCUDA(int P, int D, int M,
 	const float* projmatrix,
 	const glm::vec3* cam_pos,
 	const int W, int H,
-	const float tan_fovx, float tan_fovy,
-	const float focal_x, float focal_y,
+	// const float tan_fovx, float tan_fovy,
+	// const float focal_x, float focal_y,
 	int* radii,
 	float2* points_xy_image,
 	float* depths,
@@ -184,17 +202,25 @@ __global__ void preprocessCUDA(int P, int D, int M,
 	if (idx >= P)
 		return;
 
+	// fx = projmatrix[0], fy = projmatrix[5]
+	const float focal_x = projmatrix[0] * W / 2.0f;
+	const float focal_y = projmatrix[5] * H / 2.0f;
+	
 	// Initialize radius and touched tiles to 0. If this isn't changed,
 	// this Gaussian will not be processed further.
 	radii[idx] = 0;
 	tiles_touched[idx] = 0;
+
 	// Perform near culling, quit if outside.
 	float3 p_view;
 	if (!in_frustum(idx, orig_points, viewmatrix, projmatrix, prefiltered, p_view))
 		return;
 	// Transform point by projecting
 	float3 p_orig = { orig_points[3 * idx], orig_points[3 * idx + 1], orig_points[3 * idx + 2] };
-	float4 p_hom = transformPoint4x4(p_orig, projmatrix);
+	
+	// float4 p_hom = transformPoint4x4(p_orig, projmatrix);
+	float4 p_hom = transformPoint4x4(p_view, projmatrix);
+
 	float p_w = 1.0f / (p_hom.w + 0.0000001f);
 	float3 p_proj = { p_hom.x * p_w, p_hom.y * p_w, p_hom.z * p_w };
 
@@ -212,7 +238,15 @@ __global__ void preprocessCUDA(int P, int D, int M,
 	}
 
 	// Compute 2D screen-space covariance matrix
-	float3 cov = computeCov2D(p_orig, focal_x, focal_y, tan_fovx, tan_fovy, cov3D, viewmatrix);
+	float3 cov = computeCov2D(
+		p_orig,
+		focal_x,
+		focal_y,
+		// tan_fovx,
+		// tan_fovy,
+		cov3D,
+		viewmatrix,
+		projmatrix);
 
 	// Invert covariance (EWA algorithm)
 	float det = (cov.x * cov.z - cov.y * cov.y);
@@ -244,7 +278,6 @@ __global__ void preprocessCUDA(int P, int D, int M,
 		rgb[idx * C + 1] = result.y;
 		rgb[idx * C + 2] = result.z;
 	}
-
 
 	// Store some useful helper data for the next steps.
 	depths[idx] = p_view.z;
@@ -453,8 +486,8 @@ void FORWARD::preprocess(int P, int D, int M,
 	const float* projmatrix,
 	const glm::vec3* cam_pos,
 	const int W, int H,
-	const float focal_x, float focal_y,
-	const float tan_fovx, float tan_fovy,
+	// const float focal_x, float focal_y,
+	// const float tan_fovx, float tan_fovy,
 	int* radii,
 	float2* means2D,
 	float* depths,
@@ -480,8 +513,8 @@ void FORWARD::preprocess(int P, int D, int M,
 		projmatrix,
 		cam_pos,
 		W, H,
-		tan_fovx, tan_fovy,
-		focal_x, focal_y,
+		// tan_fovx, tan_fovy,
+		// focal_x, focal_y,
 		radii,
 		means2D,
 		depths,

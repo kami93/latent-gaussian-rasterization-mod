@@ -13,6 +13,7 @@
 #include "auxiliary.h"
 #include <cooperative_groups.h>
 #include <cooperative_groups/reduce.h>
+#include <glm/gtc/type_ptr.hpp>
 namespace cg = cooperative_groups;
 
 // Backward pass for conversion of spherical harmonics to RGB for
@@ -155,9 +156,11 @@ __global__ void computeCov2DCUDA(int P,
 	const float3* means,
 	const int* radii,
 	const float* cov3Ds,
-	const float h_x, float h_y,
-	const float tan_fovx, float tan_fovy,
+	const float width, float height,
+	// const float h_x, float h_y,
+	// const float tan_fovx, float tan_fovy,
 	const float* view_matrix,
+	const float* projmatrix,
 	const float* dL_dconics,
 	float3* dL_dmeans,
 	float* dL_dcov)
@@ -165,6 +168,9 @@ __global__ void computeCov2DCUDA(int P,
 	auto idx = cg::this_grid().thread_rank();
 	if (idx >= P || !(radii[idx] > 0))
 		return;
+
+	const float h_x = projmatrix[0] * width / 2.0f;
+	const float h_y = projmatrix[5] * height / 2.0f;
 
 	// Reading location of 3D covariance for this Gaussian
 	const float* cov3D = cov3Ds + 6 * idx;
@@ -175,15 +181,28 @@ __global__ void computeCov2DCUDA(int P,
 	float3 dL_dconic = { dL_dconics[4 * idx], dL_dconics[4 * idx + 1], dL_dconics[4 * idx + 3] };
 	float3 t = transformPoint4x3(mean, view_matrix);
 	
-	const float limx = 1.3f * tan_fovx;
-	const float limy = 1.3f * tan_fovy;
+	// const float limx = 1.3f * tan_fovx;
+	// const float limy = 1.3f * tan_fovy;
+	// const float txtz = t.x / t.z;
+	// const float tytz = t.y / t.z;
+	// t.x = min(limx, max(-limx, txtz)) * t.z;
+	// t.y = min(limy, max(-limy, tytz)) * t.z;
+	
+	// const float x_grad_mul = txtz < -limx || txtz > limx ? 0 : 1;
+	// const float y_grad_mul = tytz < -limy || tytz > limy ? 0 : 1;
+
+	float fx = projmatrix[0], fy = projmatrix[5], cx = projmatrix[8], cy = projmatrix[9];
+	const float xmin = (-1.3f - cx) / fx;
+	const float xmax = (1.3f - cx) / fx;
+	const float ymin = (-1.3f - cy) / fy;
+	const float ymax = (1.3f - cy) / fy;
 	const float txtz = t.x / t.z;
 	const float tytz = t.y / t.z;
-	t.x = min(limx, max(-limx, txtz)) * t.z;
-	t.y = min(limy, max(-limy, tytz)) * t.z;
-	
-	const float x_grad_mul = txtz < -limx || txtz > limx ? 0 : 1;
-	const float y_grad_mul = tytz < -limy || tytz > limy ? 0 : 1;
+	t.x = min(xmax, max(xmin, txtz)) * t.z;
+	t.y = min(ymax, max(ymin, tytz)) * t.z;
+
+	const float x_grad_mul = txtz < xmin || txtz > xmax ? 0 : 1;
+	const float y_grad_mul = tytz < ymin || tytz > ymax ? 0 : 1;
 
 	glm::mat3 J = glm::mat3(h_x / t.z, 0.0f, -(h_x * t.x) / (t.z * t.z),
 		0.0f, h_y / t.z, -(h_y * t.y) / (t.z * t.z),
@@ -363,8 +382,10 @@ __global__ void preprocessCUDA(
 	const glm::vec3* scales,
 	const glm::vec4* rotations,
 	const float scale_modifier,
-	const float* view,
-	const float* proj,
+	// const float* view,
+	// const float* proj,
+	const float* view_matrix,
+	const float* proj_matrix,
 	const glm::vec3* campos,
 	const float3* dL_dmean2D,
 	glm::vec3* dL_dmeans,
@@ -382,8 +403,15 @@ __global__ void preprocessCUDA(
 	float3 m = means[idx];
 
 	// Taking care of gradients from the screenspace points
-	float4 m_hom = transformPoint4x4(m, proj);
+	// float4 m_hom = transformPoint4x4(m, proj);
+	// float m_w = 1.0f / (m_hom.w + 0.0000001f);
+
+	float3 view_point = transformPoint4x3(m, view_matrix);
+	float4 m_hom = transformPoint4x4(view_point, proj_matrix);
 	float m_w = 1.0f / (m_hom.w + 0.0000001f);
+
+	glm::mat4x4 full_proj_matrix = glm::make_mat4(proj_matrix) * glm::make_mat4(view_matrix);
+	float* proj = (float*)glm::value_ptr(full_proj_matrix);
 
 	// Compute loss gradient w.r.t. 3D means due to gradients of 2D means
 	// from rendering procedure
@@ -398,19 +426,19 @@ __global__ void preprocessCUDA(
 	// of cov2D and following SH conversion also affects it.
 	dL_dmeans[idx] += dL_dmean;
 
-	// the w must be equal to 1 for view^T * [x,y,z,1]
-	float3 m_view = transformPoint4x3(m, view);
+	// // the w must be equal to 1 for view^T * [x,y,z,1]
+	// float3 m_view = transformPoint4x3(m, view);
 
-	// Compute loss gradient w.r.t. 3D means due to gradients of depth
-	// from rendering procedure
-	glm::vec3 dL_dmean2;
-	float mul3 = view[2] * m.x + view[6] * m.y + view[10] * m.z + view[14];
-	dL_dmean2.x = (view[2] - view[3] * mul3) * dL_ddepth[idx];
-	dL_dmean2.y = (view[6] - view[7] * mul3) * dL_ddepth[idx];
-	dL_dmean2.z = (view[10] - view[11] * mul3) * dL_ddepth[idx];
+	// // Compute loss gradient w.r.t. 3D means due to gradients of depth
+	// // from rendering procedure
+	// glm::vec3 dL_dmean2;
+	// float mul3 = view[2] * m.x + view[6] * m.y + view[10] * m.z + view[14];
+	// dL_dmean2.x = (view[2] - view[3] * mul3) * dL_ddepth[idx];
+	// dL_dmean2.y = (view[6] - view[7] * mul3) * dL_ddepth[idx];
+	// dL_dmean2.z = (view[10] - view[11] * mul3) * dL_ddepth[idx];
 
-	// That's the third part of the mean gradient.
-	dL_dmeans[idx] += dL_dmean2;
+	// // That's the third part of the mean gradient.
+	// dL_dmeans[idx] += dL_dmean2;
 
 	// Compute gradient updates due to computing colors from SHs
 	if (shs)
@@ -631,8 +659,9 @@ void BACKWARD::preprocess(
 	const float* cov3Ds,
 	const float* viewmatrix,
 	const float* projmatrix,
-	const float focal_x, float focal_y,
-	const float tan_fovx, float tan_fovy,
+	const float width, float height,
+	// const float focal_x, float focal_y,
+	// const float tan_fovx, float tan_fovy,
 	const glm::vec3* campos,
 	const float3* dL_dmean2D,
 	const float* dL_dconic,
@@ -653,11 +682,14 @@ void BACKWARD::preprocess(
 		means3D,
 		radii,
 		cov3Ds,
-		focal_x,
-		focal_y,
-		tan_fovx,
-		tan_fovy,
+		width, height,
 		viewmatrix,
+		projmatrix,
+		// focal_x,
+		// focal_y,
+		// tan_fovx,
+		// tan_fovy,
+		// viewmatrix,
 		dL_dconic,
 		(float3*)dL_dmean3D,
 		dL_dcov3D);
